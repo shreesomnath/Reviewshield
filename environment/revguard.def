@@ -1,0 +1,246 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
+
+# ============================================================
+# revguard — Apptainer Container
+# Target  : 2x NVIDIA RTX Pro 6000 Blackwell (96 GB each)
+# Host RAM: 125 GB
+#
+# "When the Manuscript Talks Back": defending LLM reviewers against
+# in-paper prompt injection via preference optimization.
+# AI-Native Academia @ NeurIPS 2026, Track 2.
+#
+# Base image matches the one already validated on this hardware
+# (crash_pred project) - PyTorch 2.7.0 + CUDA 12.8 + cuDNN9, Python 3.11
+# preinstalled, so torch itself is not reinstalled here.
+#
+# Build:
+#   apptainer build --fakeroot --nv revguard.sif revguard.def
+#   (--nv is required at BUILD time too, not just at run time: the %test
+#   stage imports unsloth, which touches Triton's GPU driver at import
+#   time and fails without GPU visibility during the build's own test run.)
+#
+# Shell:
+#   apptainer shell --nv --bind /media/airlab/ROCSTOR/revguard:/workspace revguard.sif
+#
+# Run script:
+#   apptainer exec --nv --bind /media/airlab/ROCSTOR/revguard:/workspace \
+#       revguard.sif python /workspace/scripts/<script>.py
+#
+# Credentials (pass at runtime, never baked into the image):
+#   Hugging Face (gated models, faster downloads):
+#     apptainer exec --env HF_TOKEN=xxxx ... revguard.sif python ...
+#   Frontier API (eval-stage only: GPT-4o-mini / Gemini Flash):
+#     apptainer exec --env OPENAI_API_KEY=xxxx --env GOOGLE_API_KEY=xxxx ... revguard.sif python ...
+# ============================================================
+
+%labels
+    Maintainer      revguard
+    GPU             NVIDIA RTX Pro 6000 Blackwell
+    CUDA            12.8
+    PyTorch         2.7.0+cu128
+    Python          3.11
+
+%environment
+    export CUDA_HOME=/usr/local/cuda
+    export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
+
+    # Both GPUs visible by default; pipeline stages pin explicitly as needed
+    export CUDA_VISIBLE_DEVICES=0,1
+
+    export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+    export NCCL_DEBUG=WARN
+    export NCCL_P2P_DISABLE=0
+
+    export OMP_NUM_THREADS=8
+    export MKL_NUM_THREADS=8
+
+    export PYTHONPATH="/workspace:$PYTHONPATH"
+
+    # HF weight cache lives on the bound project volume, not inside the
+    # image or the small local disk
+    export HF_HOME=/workspace/models
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export TOKENIZERS_PARALLELISM=false
+
+    export TMPDIR=/scratch
+    # Triton (used by unsloth/bitsandbytes) JIT-compiles kernels and caches
+    # them under $TRITON_CACHE_DIR; the default (~/.triton under $HOME,
+    # normally /root) is read-only in some execution contexts (notably
+    # during `apptainer build`'s own %test stage). Point it at the writable
+    # project-local /scratch instead. (Deliberately NOT overriding $HOME
+    # itself - apptainer auto-binds the invoking host user's real, writable
+    # $HOME at runtime, and overriding it here would break that for no
+    # benefit now that TRITON_CACHE_DIR alone fixes the caching issue.)
+    export TRITON_CACHE_DIR=/scratch/.triton
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # -- 1. System packages --
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        git curl htop tmux unzip \
+        poppler-utils \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    # -- 2. Core data / IO --
+    pip install --no-cache-dir \
+        pandas==2.2.3 \
+        numpy==1.26.4 \
+        pyarrow==18.0.0 \
+        tqdm==4.67.0 \
+        loguru==0.7.2 \
+        pyyaml==6.0.2 \
+        rich==13.9.4 \
+        click==8.1.7 \
+        python-dotenv==1.0.1 \
+        jsonschema==4.23.0 \
+        scikit-learn==1.5.2
+
+    # -- 3. Hugging Face stack (transformers ecosystem, torch already present) --
+    # Version floors/ceilings (not exact pins) chosen to satisfy unsloth's
+    # own declared requirements and let pip's resolver find one mutually
+    # consistent set in a single call - installing these piecemeal across
+    # separate pip invocations is what caused several silent cross-package
+    # conflicts during development (see process.md Step 5); a combined
+    # resolve avoids that. None of these packages pin torch tightly, so
+    # torch stays at the base image's validated 2.7.0+cu128 throughout.
+    pip install --no-cache-dir \
+        "transformers>=4.51.3,<4.57.0" \
+        "trl>=0.18.2,<=0.24.0,!=0.19.0" \
+        "peft>=0.18.0" \
+        "accelerate>=0.34.1" \
+        "datasets>=3.4.1,<4.4.0,!=4.0.*,!=4.1.0" \
+        "bitsandbytes==0.50.0" \
+        "sentencepiece==0.2.0" \
+        "huggingface_hub[hf_transfer]" \
+        "safetensors>=0.4.5"
+    # bitsandbytes==0.44.1 (an earlier pin) shipped Triton-fused kernels that
+    # reference triton.ops, an API removed from the Triton version bundled
+    # with torch 2.7.0; 0.50.0 dropped that dependency and only requires
+    # torch<3,>=2.4, which 2.7.0 satisfies with no downgrade risk.
+
+    # -- 4. Unsloth (fast LoRA/DPO fine-tuning) --
+    # Installed with --no-deps: unsloth declares a hard xformers>=0.0.27.post2
+    # requirement, but no xformers release is compatible with torch 2.7.0
+    # (checked: the era-matching xformers release pins torch==2.5.1; the
+    # current xformers release requires torch>=2.10). Confirmed live against
+    # this exact image that unsloth's current release (2026.8.9, unlike the
+    # 2024.11.9 release originally pinned here) runs fine without xformers,
+    # falling back to PyTorch's native scaled_dot_product_attention (SDPA).
+    pip install --no-cache-dir --no-deps unsloth unsloth_zoo
+    # unsloth's other real dependencies not covered by section 3 above and
+    # confirmed safe to add (none pin torch/cuda). diffusers is deliberately
+    # excluded: it is a real declared unsloth dependency but only used for
+    # diffusion-model fine-tuning, a feature this project (causal LM
+    # DPO/SFT) never exercises.
+    # torchao deliberately omitted: unsloth_zoo lists it for an optional
+    # quantization workflow this project does not use, and its latest
+    # release requires torch APIs (torch.nn.functional.ScalingType) not
+    # present in torch 2.7.0 - confirmed by a direct build failure. Core
+    # unsloth/FastLanguageModel import does not require it.
+    pip install --no-cache-dir \
+        tyro psutil "wheel>=0.42.0" cut_cross_entropy msgspec \
+        nest-asyncio "structlog>=24.1.0" "typer>=0.12.0"
+
+    # -- 5. Document parsing (PDF text extraction + injection simulation) --
+    pip install --no-cache-dir \
+        pymupdf==1.24.14 \
+        feedparser==6.0.11 \
+        arxiv==2.1.3 \
+        beautifulsoup4==4.12.3 \
+        lxml==5.3.0
+
+    # -- 6. Eval-stage frontier API clients (used only at evaluation time) --
+    pip install --no-cache-dir \
+        openai==1.55.3 \
+        google-generativeai==0.8.3 \
+        anthropic==0.39.0 \
+        tenacity==9.0.0
+
+    # -- 7. Visualization --
+    pip install --no-cache-dir \
+        matplotlib==3.9.2 \
+        seaborn==0.13.2
+
+    # -- 8. Project directories --
+    mkdir -p /workspace /scratch /outputs /logs
+    chmod 777 /workspace /scratch /outputs /logs
+
+    # -- 9. Cleanup --
+    # NOTE: do NOT rm -rf /tmp/* here - under --fakeroot, /tmp is the HOST's
+    # /tmp, so that would touch Apptainer's own build dir.
+    pip cache purge
+    apt-get clean
+
+%test
+    # Run with: apptainer test --nv revguard.sif
+    # Explicit export here too (redundant with %environment) since it is
+    # not certain %environment is sourced during apptainer build's own
+    # internal %test execution, and this is cheap insurance either way.
+    export TRITON_CACHE_DIR=/scratch/.triton
+    mkdir -p "$TRITON_CACHE_DIR"
+    python -c "
+import torch, transformers, datasets, accelerate, peft, trl, bitsandbytes
+import unsloth
+from unsloth import FastLanguageModel
+import cut_cross_entropy, msgspec
+import fitz, openai, google.generativeai, anthropic
+import pandas, numpy, sklearn, matplotlib
+
+print('=== revguard Container Test ===')
+print(f'PyTorch        : {torch.__version__}')
+assert torch.__version__.startswith('2.7.0'), (
+    f'torch was silently changed to {torch.__version__} by a dependency '
+    f'(expected 2.7.0+cu128) - check for a package that pinned its own torch.'
+)
+print(f'CUDA ver       : {torch.version.cuda}')
+print(f'GPUs           : {torch.cuda.device_count()}')
+assert torch.cuda.device_count() >= 1, 'no GPU visible - build/test with --nv'
+
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    print(f'  GPU {i}  : {p.name}  |  sm_{p.major}{p.minor}  |  {p.total_memory/1e9:.1f} GB')
+
+for i in range(torch.cuda.device_count()):
+    x = torch.ones(2048, 2048, dtype=torch.bfloat16, device=f'cuda:{i}')
+    y = (x @ x).sum()
+    print(f'  GPU {i} BF16 matmul : OK  ({y.item():.0f})')
+
+if torch.cuda.device_count() == 2:
+    t = torch.randn(1000, device='cuda:0').to('cuda:1')
+    print('  P2P GPU0->GPU1 : OK')
+
+print(f'transformers   : {transformers.__version__}')
+print(f'datasets       : {datasets.__version__}')
+print(f'accelerate     : {accelerate.__version__}')
+print(f'peft           : {peft.__version__}')
+print(f'trl            : {trl.__version__}')
+print(f'bitsandbytes   : {bitsandbytes.__version__}')
+print(f'unsloth        : imported OK, FastLanguageModel OK')
+print(f'pymupdf (fitz) : {fitz.__doc__[:30] if fitz.__doc__ else \"OK\"}')
+print(f'openai client  : {openai.__version__}')
+print(f'pandas         : {pandas.__version__}')
+print(f'scikit-learn   : {sklearn.__version__}')
+print('=== ALL TESTS PASSED ===')
+"
+
+%runscript
+    exec python "$@"
+
+%help
+    revguard - Defending LLM Reviewers Against In-Paper Prompt Injection
+    =======================================================================
+    Build:
+      apptainer build --fakeroot --nv revguard.sif revguard.def
+
+    Test:
+      apptainer test --nv revguard.sif
+
+    Shell:
+      apptainer shell --nv --bind /media/airlab/ROCSTOR/revguard:/workspace revguard.sif
+
+    Run:
+      apptainer exec --nv --bind /media/airlab/ROCSTOR/revguard:/workspace \
+          revguard.sif python /workspace/scripts/<script>.py
