@@ -93,11 +93,33 @@ Everything runs inside the Apptainer container defined in `environment/revguard.
 
 ---
 
-## 👨‍💻 Author
+## 📄 Paper
 
-Proudly engineered and developed by:
+The accompanying paper, **"ReviewShield: Defending LLM Reviewers Against In-Paper Prompt Injection under Instruction-Content Entanglement,"** was accepted for an **oral presentation** at the *AI-Native Academia: Authorship, Peer Review, and Conference Governance under AI* workshop, NeurIPS 2026.
 
-* **Somnath Luitel**
+### Citation
+
+```bibtex
+@inproceedings{luitel2026reviewshield,
+  title     = {ReviewShield: Defending LLM Reviewers Against In-Paper Prompt
+               Injection under Instruction-Content Entanglement},
+  author    = {Luitel, Somnath and Singh, Prabhjot and Thapa, Suraj and
+               Singh, Manmeet and Durkee, Josh},
+  booktitle = {NeurIPS 2026 Workshop on AI-Native Academia: Authorship,
+               Peer Review, and Conference Governance under AI},
+  year      = {2026}
+}
+```
+
+---
+
+## 👨‍💻 Authors
+
+* **Somnath Luitel** — Western Kentucky University
+* **Prabhjot Singh** — Lexsi Labs; University of Texas at Austin
+* **Suraj Thapa** — Oklahoma State University
+* **Manmeet Singh** — Western Kentucky University
+* **Josh Durkee** — Western Kentucky University
 
 <div align="center">
   <br/>
